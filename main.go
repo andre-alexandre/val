@@ -3,22 +3,40 @@ package val
 import (
 	"fmt"
 	"reflect"
+	"sync"
+	"unsafe"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 )
+
+var activationPool = sync.Pool{
+	New: func() any {
+		return new(activation)
+	},
+}
 
 type Validator struct {
 	rules map[reflect.Type]*structRules
 }
 
 func CreateValidator(structs ...any) (*Validator, error) {
-	env, err := cel.NewEnv(
-		cel.Variable("self", cel.DynType),
-	)
-	if err != nil {
-		return nil, err
+	envs := make(map[*cel.Type]*cel.Env)
+	envFor := func(t *cel.Type) (*cel.Env, error) {
+		if env, ok := envs[t]; ok {
+			return env, nil
+		}
+		env, err := cel.NewEnv(
+			cel.Variable("self", t),
+			cel.CrossTypeNumericComparisons(true),
+		)
+		if err != nil {
+			return nil, err
+		}
+		envs[t] = env
+		return env, nil
 	}
 
 	v := &Validator{
@@ -60,6 +78,13 @@ func CreateValidator(structs ...any) (*Validator, error) {
 				continue
 			}
 
+			celType, conv := converterFor(field.Type)
+
+			env, err := envFor(celType)
+			if err != nil {
+				return nil, err
+			}
+
 			ast, issues := env.Compile(expression)
 			if issues.Err() != nil {
 				return nil, fmt.Errorf(
@@ -70,7 +95,10 @@ func CreateValidator(structs ...any) (*Validator, error) {
 				)
 			}
 
-			program, err := env.Program(ast, cel.EvalOptions(cel.OptOptimize))
+			program, err := env.Program(ast,
+				cel.CustomDecoratorV2(fastMatches),
+				cel.EvalOptions(cel.OptOptimize),
+			)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"%s.%s: %w",
@@ -81,10 +109,11 @@ func CreateValidator(structs ...any) (*Validator, error) {
 			}
 
 			sr.fields = append(sr.fields, fieldRule{
-				index:   i,
+				offset:  field.Offset,
 				name:    field.Name,
 				message: field.Tag.Get("valerr"),
 				program: program,
+				conv:    conv,
 			})
 		}
 
@@ -101,10 +130,13 @@ func (v *Validator) Validate(input any) []error {
 		return []error{fmt.Errorf("cannot validate nil")}
 	}
 
+	// base is the address of the struct; fields are read at base+offset.
+	var base unsafe.Pointer
 	if value.Kind() == reflect.Pointer {
 		if value.IsNil() {
 			return []error{fmt.Errorf("cannot validate nil pointer")}
 		}
+		base = value.UnsafePointer()
 		value = value.Elem()
 	}
 
@@ -121,15 +153,28 @@ func (v *Validator) Validate(input any) []error {
 		}
 	}
 
+	if base == nil {
+		// Passed by value: the copy inside the interface is not addressable,
+		// so take an addressable copy (one extra allocation; pass a pointer
+		// to avoid it).
+		cp := reflect.New(value.Type())
+		cp.Elem().Set(value)
+		base = cp.UnsafePointer()
+	}
+
 	var errs []error
-	activation := activation{}
+	act := activationPool.Get().(*activation)
+	defer func() {
+		act.value = nil
+		activationPool.Put(act)
+	}()
 
 	for i := range rules.fields {
 		rule := &rules.fields[i]
 
-		activation.value = value.Field(rule.index).Interface()
+		act.value = rule.conv(unsafe.Add(base, rule.offset))
 
-		result, _, err := rule.program.Eval(&activation)
+		result, _, err := rule.program.Eval(act)
 		if err != nil {
 			errs = append(errs, fmt.Errorf(
 				"field %s: %w",
@@ -152,6 +197,43 @@ func (v *Validator) Validate(input any) []error {
 	return errs
 }
 
+func converterFor(t reflect.Type) (*cel.Type, func(unsafe.Pointer) ref.Val) {
+	switch t.Kind() {
+	case reflect.Bool:
+		return cel.BoolType, func(p unsafe.Pointer) ref.Val { return types.Bool(*(*bool)(p)) }
+	case reflect.Int:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*int)(p)) }
+	case reflect.Int8:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*int8)(p)) }
+	case reflect.Int16:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*int16)(p)) }
+	case reflect.Int32:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*int32)(p)) }
+	case reflect.Int64:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*int64)(p)) }
+	case reflect.Uint8:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*uint8)(p)) }
+	case reflect.Uint16:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*uint16)(p)) }
+	case reflect.Uint32:
+		return cel.IntType, func(p unsafe.Pointer) ref.Val { return types.Int(*(*uint32)(p)) }
+	case reflect.Uint:
+		return cel.UintType, func(p unsafe.Pointer) ref.Val { return types.Uint(*(*uint)(p)) }
+	case reflect.Uint64:
+		return cel.UintType, func(p unsafe.Pointer) ref.Val { return types.Uint(*(*uint64)(p)) }
+	case reflect.Float32:
+		return cel.DoubleType, func(p unsafe.Pointer) ref.Val { return types.Double(*(*float32)(p)) }
+	case reflect.Float64:
+		return cel.DoubleType, func(p unsafe.Pointer) ref.Val { return types.Double(*(*float64)(p)) }
+	case reflect.String:
+		return cel.StringType, func(p unsafe.Pointer) ref.Val { return types.String(*(*string)(p)) }
+	default:
+		return cel.DynType, func(p unsafe.Pointer) ref.Val {
+			return types.DefaultTypeAdapter.NativeToValue(reflect.NewAt(t, p).Elem().Interface())
+		}
+	}
+}
+
 type fieldError struct {
 	Field   string
 	Message string
@@ -162,10 +244,11 @@ func (e *fieldError) Error() string {
 }
 
 type fieldRule struct {
-	index   int
+	offset  uintptr
 	name    string
 	message string
 	program cel.Program
+	conv    func(unsafe.Pointer) ref.Val
 }
 
 type structRules struct {
