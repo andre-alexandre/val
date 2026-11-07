@@ -66,9 +66,7 @@ func CreateValidator(structs ...any) (*Validator, error) {
 			fields: make([]fieldRule, 0, typ.NumField()),
 		}
 
-		for i := 0; i < typ.NumField(); i++ {
-			field := typ.Field(i)
-
+		for field := range typ.Fields() {
 			if field.PkgPath != "" {
 				continue
 			}
@@ -130,7 +128,6 @@ func (v *Validator) Validate(input any) []error {
 		return []error{fmt.Errorf("cannot validate nil")}
 	}
 
-	// base is the address of the struct; fields are read at base+offset.
 	var base unsafe.Pointer
 	if value.Kind() == reflect.Pointer {
 		if value.IsNil() {
@@ -154,9 +151,6 @@ func (v *Validator) Validate(input any) []error {
 	}
 
 	if base == nil {
-		// Passed by value: the copy inside the interface is not addressable,
-		// so take an addressable copy (one extra allocation; pass a pointer
-		// to avoid it).
 		cp := reflect.New(value.Type())
 		cp.Elem().Set(value)
 		base = cp.UnsafePointer()
@@ -164,7 +158,14 @@ func (v *Validator) Validate(input any) []error {
 
 	var errs []error
 	act := activationPool.Get().(*activation)
+
+	frame, err := interpreter.NewExecutionFrame(act)
+	if err != nil {
+		activationPool.Put(act)
+		return []error{err}
+	}
 	defer func() {
+		frame.Close()
 		act.value = nil
 		activationPool.Put(act)
 	}()
@@ -174,7 +175,7 @@ func (v *Validator) Validate(input any) []error {
 
 		act.value = rule.conv(unsafe.Add(base, rule.offset))
 
-		result, _, err := rule.program.Eval(act)
+		result, _, err := rule.program.Eval(frame)
 		if err != nil {
 			errs = append(errs, fmt.Errorf(
 				"field %s: %w",

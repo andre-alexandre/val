@@ -8,6 +8,8 @@ import (
 	"cel.dev/cel-go/interpreter"
 )
 
+// fastMatches only speeds up simple regexes like ^[a-zA-Z0-9]+$ or ^[a-z]*$
+// any other pattern still runs through the regexp package.
 func fastMatches(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok || call.Function() != "matches" || len(call.Args()) != 2 {
@@ -31,7 +33,6 @@ func fastMatches(i interpreter.InterpretableV2) (interpreter.InterpretableV2, er
 	m.table, m.allowEmpty, m.simple = parseSimpleClass(string(pattern))
 	return m, nil
 }
-
 
 func parseSimpleClass(p string) (table [256]bool, allowEmpty, ok bool) {
 	n := len(p)
